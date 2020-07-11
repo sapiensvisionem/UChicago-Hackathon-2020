@@ -1,0 +1,752 @@
+---
+title: "Hackathon"
+author: "Ji Hun Lee"
+date: "6/19/2020"
+output: html_document
+---
+
+```{r setup, include = FALSE, echo=FALSE}
+knitr::opts_chunk$set(fig.align = 'center', echo=FALSE)
+```
+
+```{r Load-Libraries, include=FALSE}
+# data manipulation libraries
+library(scales)
+library(readxl)
+library(plotly)
+library(viridis)
+library(tidyverse)
+library(lubridate)
+
+# geospatial libraries
+library(rgdal)
+library(broom)
+library(rgeos)
+library(plotly)
+library(viridis)
+library(geojsonio)
+library(RColorBrewer)
+
+# modeling libraries
+library(did) # difference in differences
+library(rdd) # regression discontinuity design
+library(AER) # econometric methods and datasets
+library(plm) # panel data models
+library(caret) # for splitting data, model evaluation metrics
+library(haven) # importing STATA files
+library(jtools) # using summ()
+library(GGally) # nice EDA tool
+library(lmtest) # linear model assummption tests
+library(geepack)
+library(tseries) # autocorrelation tests
+library(graphics) # visualization
+library(het.test) # heteroskedasticity test
+library(reshape2) # data wrangling
+library(stargazer) # model summaries in nice format
+library(tidyverse) # data manipulation
+library(tidymodels) # data preprocessing
+library(robustbase) # heteroskedasticity robust linear models
+```
+
+```{r Load-Data, include=FALSE}
+orig_response <- read.csv('C:/Users/jihun/Downloads/Global_Mobility_Report.csv')
+orig_predictor <- read_excel('C:/Users/jihun/Downloads/COVID-19 US state policy database 6_10_2020.xlsx', skip=5, col_names=F, na = '0')
+orig_predictor2 <- read_excel('C:/Users/jihun/Downloads/COVID-19 US state policy database 6_10_2020.xlsx')
+```
+
+# Data Transformation
+
+Response variable is the mobility metric.
+
+```{r Create-Response, echo=FALSE}
+# Create response data containing variables grocery_and_pharcy, retail_recreation, etc
+create_response <- function(orig_response) {
+  response <- orig_response %>%
+      # filter only US
+    filter(country_region_code == 'US',
+           # filter only state level information, discard county
+           sub_region_1 != '',
+           sub_region_2 == '') %>%
+    # remove unneeded columns
+    select(-c(country_region_code, country_region, iso_3166_2_code, census_fips_code, sub_region_2)) %>%
+    # read date as Date type
+    mutate(date = as.Date(date)) %>%
+    # rename columns
+    rename(state = sub_region_1)
+  names(response) <- c('state','date','retail_and_recreation', 'grocery_and_pharmacy', 'parks',
+                       'transit_stations', 'workplaces', 'residential')
+  # sort rows by date and then state
+  response <- response %>%
+    arrange(date, state)
+  return(response)
+}
+response <- create_response(orig_response)
+glimpse(response)
+```
+
+Predictor variables contain information about state names, dates, whether a particular policy is implemented on date in a state, and each state's attribute
+
+```{r Create-Predictor, echo=FALSE}
+# Create predictor data containing policy and attribute variables
+create_predicor <- function(orig_predictor, orig_predictor2) {
+  # get the abbreviated names 
+  column_names <- names(orig_predictor2)
+  column_name_meanings <- orig_predictor2[1,]
+  # replace the column names with the abbreviated names
+  names(orig_predictor) <- column_names
+  # calculate the number of days spanned in the data
+  date_range <- max(response$date)-min(response$date)-1
+  # replicate the data for creating panel data
+  data_list <- list()
+  for (i in 1:date_range) {
+    data_list[[i]] <- orig_predictor
+  }
+  predictor <- do.call(rbind, orig_predictor)
+  # create a date variable
+  date <- seq(as.Date("2020-02-15"), as.Date("2020-06-07"), "days")
+  date <- rep(date, each = 51) # 51 states
+  # append the date variable
+  predictor <- predictor %>%
+    mutate(DATE = date) 
+  # transform date columns into binary variables
+  predictor2 <- predictor %>%
+    mutate_if(is.POSIXct, ~if_else(DATE >= .x, 1, 0)) %>%
+    select(-POSTCODE, TLHLCL24) %>%
+    mutate_if(is.numeric, replace_na, replace = 0) %>%
+    arrange(DATE, STATE)
+  return(predictor2)
+}
+predictor <- create_predicor(orig_predictor, orig_predictor2)
+glimpse(predictor)
+```
+
+Combine both tables.
+
+```{r Final-Data, echo=FALSE}
+# combine the response and predictor tables
+create_final_data <- function(response, predictor) {
+  # combine the two tables but remove redundant columns
+  df <- response %>%
+    bind_cols(predictor2) %>%
+    select(-c(STATE, DATE, TLHLCL24))
+  # combine columns of the same policies
+  mydata <- df %>%
+    mutate(STAYHOME = ifelse(STAYHOME + END_STHM == 1, 1, 0),
+           CLBSNS = ifelse(CLBSNS + END_BSNS == 1, 1, 0),
+           CLREST = ifelse(CLREST + ENDREST == 1, 1, 0),
+           CLGYM = ifelse(CLGYM + ENDGYM == 1, 1, 0),
+           CLMOVIE = ifelse(CLMOVIE + END_MOV == 1, 1, 0),
+           ELECPRCR = ifelse(ELECPRCR + ENDELECP == 1, 1, 0)) %>%
+    select(-c(END_STHM, END_BSNS, ENDREST, ENDGYM, END_MOV, ENDELECP))
+  return(mydata)
+}
+df <- create_final_data(response, predictor)
+glimpse(df)
+```
+
+# Exploratory Data Analysis
+
+## Correlation matrix
+
+```{r Correlation-Matrix, echo=FALSE}
+str(df[,3:8])
+ggcorr(df[,3:8], method = c('everything', 'pearson'))
+```
+
+```{r Correlation-Matrix2, echo=FALSE}
+ggpairs(df[,3:8], progress = F)
+```
+
+- transition, workplace, residential and retail are bimodal.
+- retail have two peaks in both negative and positive
+- parks has skewed distribution
+- some transit stations have no effect while others have generally reduced in spread out way
+- Two clear peaks for work and residential 
+
+### Interactive plotly of each metric by state
+
+```{r Line-Plot-Policy-Implementation, echo=FALSE}
+# state of emergency "2020-02-29 UTC"
+# stay at home order "2020-03-19 UTC"
+# closure of businesses "2020-03-19 UTC"
+# end of closure "2020-04-20 UTC"
+# face mask for employees "2020-04-03 UTC"
+# face mask for all  "2020-04-08 UTC"
+key_dates <- as.Date(c("2020-02-29 UTC","2020-03-19 UTC", "2020-03-19 UTC", '2020-04-12 UTC' ,"2020-04-20 UTC", "2020-04-03 UTC", "2020-04-08 UTC"))
+key_events <- c('state of emergency', 'stay at home order', 'closure of businesses', 'Easter' ,'end of business closure', 'face mask for employees', 'face mask for all')
+events <- data.frame(key_dates = key_dates, key_events = key_events)
+response_long <- response %>%
+  gather(key = 'metrics', value = 'value', -c(state, date))
+head(response_long)
+metric_lineplot <-ggplot(response_long, aes(x = date)) +
+  geom_line(aes(y = value, col = state, group = state)) +
+  facet_wrap(vars(metrics), scale='free') +
+  labs(x = 'Date', y = 'Retail and Recreation', title = 'Retail and Recreation Mobility for 50 States') +
+  theme(legend.position = "none") + 
+  theme(text = element_text(color = "#22211d"),
+       plot.background = element_rect(fill = "#f5f5f2", color = NA),
+       panel.background = element_rect(fill = "#f5f5f2", color = NA),
+       legend.background = element_rect(fill = "#f5f5f2", color = NA)) +
+  geom_vline(data= events, aes(xintercept = key_dates)) +
+  geom_text(data = events, aes(x=key_dates, label=key_events, y=0), colour="blue", angle=45, check_overlap=T, position=position_jitter(), size = 2.75) 
+metric_lineplot
+```
+
+```{r Interactive-Plot, echo=FALSE}
+ggplotly(metric_lineplot)
+```
+
+### Geospatial Map: interactive plot on time
+
+```{r, include=FALSE}
+# closure of businesses "2020-03-19 UTC"
+# end of closure "2020-04-20 UTC"
+mean_difference <- df %>%
+  group_by(state) %>%
+    summarise(before_avg = mean(retail_and_recreation[date >= as.Date("2020-03-19 UTC") & date <= as.Date("2020-04-20 UTC")], na.rm = T),
+              after_avg = mean(retail_and_recreation[date > as.Date("2020-04-20 UTC")], na.rm = T)) %>%
+  mutate(mean_diff = after_avg - before_avg)
+```
+
+```{r Geospatial-Map, message = FALSE, echo=FALSSE}
+# import geospatial map and data
+# ale <- read.csv('C:/Users/jihun/Downloads/sale.csv')
+us <- readOGR("C:/Users/jihun/Downloads/us_states_hexgrid.geojson")
+# assign iso3166_2 labels
+centers <- cbind.data.frame(data.frame(gCentroid(us, byid=TRUE), id=us@data$iso3166_2))
+# fortify model with data
+us_map <- fortify(us, region="iso3166_2")
+# replace column bees with sale
+us@data <- subset(us@data, select = -bees)
+us@data$rr_diff <- mean_difference$mean_diff
+
+# create a ggplot2 object
+gg <- ggplot()
+# create a hex map object
+gg <- gg + geom_map(data=us_map, map=us_map,
+                    aes(x=long, y=lat, map_id=id),
+                    color="white", size=0.5)
+# fill in color by revenue
+gg <- gg  + geom_map(data=us@data, map=us_map,
+                    aes(fill=rr_diff, map_id=iso3166_2))
+# create boundaries between states
+gg <- gg  + geom_map(data=us@data, map=us_map,
+                    aes(map_id=iso3166_2),
+                    fill="#ffffff", alpha=0, color="white",
+                    show_guide=FALSE)
+# label each state by abbreviation
+gg <- gg  + geom_text(data=centers, aes(label=id, x=x, y=y), color="black", size=8)
+# color scale
+gg <- gg  + scale_fill_distiller(palette="RdPu", na.value="#7f7f7f", 
+                                name="Change in Mean Mobility Percentages", 
+                                labels = comma,
+                                guide = guide_legend( keyheight = unit(3, units = "mm"), keywidth=unit(12, units = "mm"), label.position = "bottom", title.position = 'top', nrow=1) 
+)
+# map projection
+gg <- gg + coord_map()
+# label axes and title
+gg <- gg  + labs(x=NULL, y=NULL, title='Surge in Retail/Recreation After End of Business Closure has been unequal')
+# black_white theme on the background
+gg <- gg  + theme_bw()
+# clean up
+gg <- gg  + theme(panel.border=element_blank(),
+                 panel.grid=element_blank(),
+                 axis.ticks=element_blank(),
+                 axis.text=element_blank(),
+                 legend.position = c(0.5, 0.9),
+                 text = element_text(color = "#22211d"),
+                 plot.background = element_rect(fill = "#f5f5f2", color = NA), 
+                 panel.background = element_rect(fill = "#f5f5f2", color = NA), 
+                 legend.background = element_rect(fill = "#f5f5f2", color = NA),
+                 plot.title = element_text(size= 30, hjust=0.5, color = "#4e4d47", 
+                                           margin = margin(b = -0.1, t = 0.4, l = 2, unit = "cm")))
+gg
+```
+
+Every state has increased in the intensity of visits to retail and recreation, but surges have been unequal.
+
+## Calendar Heatmap across States
+
+Look at retail and recreation mobility rates for New York, Illinois, and Texas.
+
+```{r Create-Calendar-Data, include=FALSE}
+# create year and month variables
+calendar_df <-
+  response %>%
+  mutate(year = year(date),
+         month = month(date),
+         day = day(date),
+         wday = wday(date, label = TRUE, abbr = TRUE)) %>%
+  select(-c(date)) %>%
+  # mutate_at(2:7, scale) %>% # 2:7 is the metric columns
+  gather(key = 'metrics', value = 'value', -c(state, year, month, day, wday)) %>%
+  filter(state %in% c('New York', 'Illinois', 'Texas'),
+         metrics == 'retail_and_recreation')
+```
+
+```{r Calendar-Heatmap, echo=FALSE}
+# create a calendar heatmap
+calendar_heatmap <-
+  calendar_df %>%
+  ggplot(aes(x = month, y = wday, fill = value)) +
+    geom_tile(color = 'white', size = 0.1) +
+    scale_fill_viridis() +
+    facet_wrap(~ state) +
+    theme_minimal() +
+    # scale_x_discrete(position = 'bottom') +
+    labs(title = 'Retail and Recreation Changes through Months from February',
+         x = 'Months',
+         y = 'Years') +
+    theme(
+      #panel.border=element_blank(),
+      #     panel.grid=element_blank(),
+      #     legend.position = c(0.85, 0.1),
+           text = element_text(color = "#22211d"),
+           plot.background = element_rect(fill = "#f5f5f2", color = NA),
+           panel.background = element_rect(fill = "#f5f5f2", color = NA),
+           legend.background = element_rect(fill = "#f5f5f2", color = NA))
+calendar_heatmap
+```
+
+We see some weekday vs weekend seasonality in all three states. The changes in mobility have been the sharpest for NY.
+
+## Which Policies Come First in General?
+
+```{r Rank-Policies-by-Date, echo=FALSE}
+date_only <- orig_predictor %>%
+  select_if(is.POSIXct)
+rank_date <- t(apply(date_only, 1, rank))
+intermed <- data.frame(STATE =orig_predictor$STATE,rank_date)
+rank_policy <- intermed %>% group_by(STATE) %>% summarise_if(is.numeric, mean) %>% column_to_rownames(var="STATE")
+colMeans(rank_policy) %>% sort()
+```
+
+On average, state emergeny comes first and then is followed by business closures.
+
+# Panel Data Models Analysis
+
+pdata.frame() converts dataframe into panel data format.
+
+```{r Create-Panel-Data, echo=FALSE}
+mydata <- read.csv('C:/Users/jihun/Downloads/hackathon_data.csv')
+mydata <- read.csv('C:/Users/jihun/Downloads/hackathon_pdf.csv')
+mydata <- mydata %>%
+  filter(date != as.Date('2020-04-12'))
+pdf <- pdata.frame(mydata, index=c('state', 'date'))
+head(pdf)
+```
+
+## Correlogram
+
+```{r Correlogram, echo=FALSE}
+policy_columns <- c(9:47, 53:59)
+policies <- pdf[,policy_columns]
+# Draw the upper heatmap with hclust
+corrplot(cor(policies), method = 'color', type = 'upper', order = 'hclust', tl.cex = 0.75, tl.srt = 45)
+```
+
+We see some moderate level of correlation among variables.
+
+## K-Mmeans on Predictors
+```{r K-Means, echo=FALSE}
+kmean_ss <- numeric(19)
+for (k in 2:20) {
+  kmean_mod <- kmeans(policies, centers=k)
+  kmean_ss[k-1] <- kmean_mod$tot.withinss
+}
+plot(2:20, kmean_ss)
+```
+
+No clear clusters emerge from K-Means
+
+# Formula generator
+
+I use this to copy and paste formulae into plm() function.
+
+```{r Generate-Regression-Formula, echo=FALSE}
+# formula writing function
+expand_formula <- 
+  function(form="A ~.",varNames=c("A","B","C")){
+  has_dot <- any(grepl('.',form,fixed=TRUE))
+  if(has_dot){
+    ii <- intersect(as.character(as.formula(form)),
+          varNames)
+    varNames <- varNames[!grepl(paste0(ii,collapse='|'),varNames)]
+
+   exp <- paste0(varNames,collapse='+')
+   as.formula(gsub('.',exp,form,fixed=TRUE))
+
+  }
+  else as.formula(form)
+  }
+(eform <- expand_formula("parks ~ .",names(pdf)))
+```
+
+### Formulae
+
+I try three formulae: 1) only main policies (that I know from iterative modeling process retrospectively) 2) only policies 3) all explanatory variables
+
+```{r Formulae, include=FALSE}
+main_policy_rr <- retail_and_recreation ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT
+
+main_policy_grocery <- grocery_and_pharmacy ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT
+
+main_policy_work <- workplaces ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT
+
+main_policy_park <- parks ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT
+
+main_policy_residential <- residential ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT
+
+main_policy_transit_stations <- transit_stations ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT
+
+all_policy <- retail_and_recreation ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + RELIGEX + FM_ALL + 
+    FM_EMP + ALCOPEN + GUNOPEN + CLREST + RSTOUTDR + CLGYM + 
+    CLMOVIE + EVICINTN + EVICENF + RNTGP + UTILSO + MORGFR + 
+    SNAPALLO + SNAPEBT + SNAPSUSP + MED1135W + ACAENROL + 
+    ELECPRCR + WTPRD + WV_WTPRD + WV_WKSR + UIQUAR + UICLDCR + 
+    UIEXTND + UIMAXAMT + UIMAXEXT + UIMAXDUR + UIMAXCAR + PDSKLV + 
+    MEDEXP
+
+all_variables <- retail_and_recreation ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + RELIGEX + FM_ALL + 
+    FM_EMP + ALCOPEN + GUNOPEN + CLREST + RSTOUTDR + CLGYM + 
+    CLMOVIE + EVICINTN + EVICENF + RNTGP + UTILSO + MORGFR + 
+    SNAPALLO + SNAPEBT + SNAPSUSP + MED1135W + ACAENROL + 
+    ELECPRCR + WTPRD + WV_WTPRD + WV_WKSR + UIQUAR + UICLDCR + 
+    UIEXTND + UIMAXAMT + UIMAXEXT + UIMAXDUR + UIMAXCAR + PDSKLV + 
+    MEDEXP + POPDEN18 + POP18 + SQML + HMLS19 + UNEMP18 + POV18 + 
+    RISKCOV + DEATH18
+```
+
+## Coefficients Plotter
+
+```{r Plot-Coefficient, include=FALSE}
+# takes in lm() object and outputs a barplot of sorted coefficient values
+plot_coeffs_S <- function(mlr_model) {
+  coeffs <- sort(coefficients(mlr_model), decreasing = TRUE)  ### changed
+  coeffs <- coeffs[]
+  mp <- barplot(coeffs, col="#3F97D0", xaxt='n', main="Regression Coefficients")
+  lablist <- names(coeffs)
+  text(mp, par("usr")[3], labels = lablist, srt = 45, adj = c(1.1,1.1), xpd = TRUE, cex=0.6)
+}
+# takes in coef(plm()) object and outputs a barplot of sorted coefficient values
+plot_coeffs_S1 <- function(coef) {
+  coeffs <- sort(coef[,1], decreasing = TRUE)  ### changed
+  coeffs <- coeffs[]
+  mp <- barplot(coeffs, col="#3F97D0", xaxt='n', main="Regression Coefficients")
+  lablist <- names(coeffs)
+  text(mp, par("usr")[3], labels = lablist, srt = 45, adj = c(1.1,1.1), xpd = TRUE, cex=0.6)
+}
+```
+
+## Pooled OLS
+
+Linear regression with pooled data of cross sectional and longitudinal elements.
+
+### Only Main Policies
+
+```{r pooled-OLS-Main-Policies, echo=FALSE}
+pooled_mod_main_policy <- plm(main_policy, 
+              data=pdf, model='pooling')
+summary(pooled_mod_main_policy)
+```
+
+```{r, echo=FALSE}
+plot_coeffs_S(pooled_mod_main_policy)
+```
+
+### OLS vs Random Effect
+
+```{r OLS-vs-Random-Effect-Test, echo=FALSE}
+plmtest(pooled_mod_main_policy, type=c("bp"))
+```
+Here we can reject the null and conclude that random effects is appropriate. This is, there is evidence of significant differences across countries, therefore we should not run a simple OLS regression.
+
+### Include all policy
+
+```{r Pooled-OLS-All-Policies, echo=FALSE}
+pooled_mod_all_policy <- plm(all_policy, 
+              data=pdf, model='pooling')
+summary(pooled_mod_policy)
+plot_coeffs_S(pooled_mod_all_policy)
+```
+
+### Include all variables
+
+```{r All-Variables, echo=FALSE}
+pooled_mod_all_variables <- plm(all_variables, 
+              data=pdf, model='pooling')
+summary(pooled_mod_all_variables)
+plot_coeffs_S(pooled_mod_all_variables)
+```
+
+As expected, states with more population density have greater penalty in mobility rates.
+
+## Fixed Effect Model
+
+In panel data, there are several sources of variation we need to capture:
+
+1. observed time-variant variation: change in policy, number of cases
+2. unobserved time-variant variation: number of companies going remote, bad weather
+3. observed time-invariant variation: state size, density of state, population, etc
+4. unobserved time-invariant variation (fixed effect): characteristics of state, time-specific effect (seasonality)
+
+Fixed effect model controls for 1, 3, and 4. 
+1,3,4 are controlled.
+2 is not controlled. We need to assume that 2 is minimal, which is a big assumption (exogeneity assumption). If exogeneity assumption fails, then our coefficient's standard error is biased.
+
+The reason it's called fixed effect is because unlike a simple OLS, it can control for unobservable time-invariant individual variation (aka fixed effect - 3 and 4). Fixed effects are captured by individual and time effects. 
+
+Time-variant individual heterogeneity is captured by error term and we hope that it is serially uncorrelated (else our standard errors are biased).
+
+Another assumption for fixed effect model is that effects are additive and linear.
+
+### Include only relevant policy
+
+```{r Main-Policies-FE-Models, include=FALSE}
+fe_mod_main_policy_rr <- plm(main_policy_rr, 
+              data=pdf, model='within', effects = 'oneway')
+fe_mod_main_policy_grocery <- plm(main_policy_grocery, 
+              data=pdf, model='within', effects = 'oneway')
+fe_mod_main_policy_work <- plm(main_policy_work, 
+              data=pdf, model='within', effects = 'oneway')
+fe_mod_main_policy_park <- plm(main_policy_park, 
+              data=pdf, model='within', effects = 'oneway')
+fe_mod_main_policy_residential <- plm(main_policy_residential, 
+              data=pdf, model='within', effects = 'oneway')
+fe_mod_main_policy_transit <- plm(main_policy_transit_stations, 
+              data=pdf, model='within', effects = 'oneway')
+```
+
+```{r Summary-of-FE-Models, echo=FALSE}
+rob_se <- list(sqrt(diag(vcovHC(fe_mod_main_policy_rr, type='HC0'))),
+               sqrt(diag(vcovHC(fe_mod_main_policy_grocery, type='HC0'))),
+               sqrt(diag(vcovHC(fe_mod_main_policy_work, type='HC0'))),
+               sqrt(diag(vcovHC(fe_mod_main_policy_park, type='HC0'))),
+               sqrt(diag(vcovHC(fe_mod_main_policy_residential, type='HC0'))),
+               sqrt(diag(vcovHC(fe_mod_main_policy_transit, type='HC0'))))
+
+stargazer(fe_mod_main_policy_rr, fe_mod_main_policy_grocery, fe_mod_main_policy_work, 
+          fe_mod_main_policy_park, fe_mod_main_policy_residential, fe_mod_main_policy_transit,
+          type='text', 
+          title='Fixed Effect Models of Google Mobility Measures', 
+          style='aer', 
+          column.labels=c('Retail and Recreation', 'Grocery and Pharmacy', 'Workplaces',
+                          'Parks', 'Residential', 'Transit'), 
+          digits=2,
+          se = rob_se,
+          dep.var.labels.include = FALSE,
+          model.numbers = FALSE)
+```
+
+Plot coefficient values for 6 main policies.
+
+```{r Plot-Coefficient-Values, echo=FALSE}
+a1 <- coeftest(fe_mod_main_policy_rr, vcovHC(fe_mod_main_policy_rr, method='arellano'))
+a2 <- coeftest(fe_mod_main_policy_grocery, vcovHC(fe_mod_main_policy_grocery, method='arellano'))
+a3 <- coeftest(fe_mod_main_policy_work, vcovHC(fe_mod_main_policy_work, method='arellano'))
+a4 <- coeftest(fe_mod_main_policy_park, vcovHC(fe_mod_main_policy_park, method='arellano'))
+a5 <- coeftest(fe_mod_main_policy_transit, vcovHC(fe_mod_main_policy_transit, method='arellano'))
+a6 <- coeftest(fe_mod_main_policy_residential, vcovHC(fe_mod_main_policy_residential, method='arellano'))
+policy_names <- c('STEMERG', 'STAYHOME', 'CLBSNS', 'FM_EMP', 'CLREST', 'CLSCHOOL')
+coefficients <-
+  cbind(a1[,1][policy_names],
+        a2[,1][policy_names],
+        a3[,1][policy_names],
+        a4[,1][policy_names],
+        a5[,1][policy_names],
+        a6[,1][policy_names])
+coefficients
+frame <- data.frame(coefficients)
+frame
+names(frame) <- c('Retail_and_Recreation', 'Grocery_and_Pharmacy', 'Workplaces',
+                                 'Parks', 'Transit_Stations', 'Residential')
+frame <- add_rownames(frame, var = "Variables")
+frame <- frame %>%
+  gather(key = 'Metric', value = 'Value', -c(Variables)) %>%
+  mutate(Variables = recode(Variables, STEMERG = 'State of Emergency', STAYHOME = "Stay at Home", CLBSNS = "Close Business", FM_EMP = 'Face Mask Employee', CLREST = 'Close Restaurant', CLSCHOOL = 'Close School'))
+frame
+ggplot(frame, aes(x=Variables, y = Value, fill = Variables)) +
+  geom_col() +
+  facet_wrap(vars(Metric), scale='free') +
+  labs(x = 'Policies', y = 'Coefficient Value', title = 'Effect of Policies on Mobility') +
+  theme(legend.position = "none") + 
+  theme(text = element_text(color = "#22211d"),
+       plot.background = element_rect(fill = "#f5f5f2", color = NA),
+       panel.background = element_rect(fill = "#f5f5f2", color = NA),
+       legend.background = element_rect(fill = "#f5f5f2", color = NA)) +
+  theme(axis.text.x = element_text(angle = 30))
+```
+
+## Fixed Effect Diagnostics
+
+Serial correlation tests apply to macro panels with long time series. Not a problem in micro panels (with very few years). The null is that there is not serial correlation
+
+```{r echo=FALSE}
+pbgtest(fe_mod_main_policy)
+```
+
+The Dickey-Fuller test to check for stochastic trends. The null hypothesis is that the
+series has a unit root (i.e. non-stationary). If unit root is present you can take the first difference of the variable. 
+
+```{r echo=FALSE}
+library(tseries)
+adf.test(pdf$retail_and_recreation, k=2) # roughly stationary
+```
+
+The null hypothesis for the Breusch-Pagan test is homoskedasticity.
+
+```{r echo=FALSE}
+library(lmtest)
+bptest(main_policy, data = pdf, studentize=F) # heteroskedasticity present
+```
+
+If hetersokedaticity is detected you can use robust covariance matrix to account for it.
+
+```{r echo=FALSE}
+coeftest(fe_mod_main_policy, vcovHC(fe_mod_main_policy, method='arellano'))
+```
+
+```{r echo=FALSE}
+pcdtest(fe_mod_main_policy, test = c("lm"))
+pcdtest(fe_mod_main_policy, test = c("cd"))
+```
+
+There is a strong evidence for cross-sectional dependence. The null hypothesis in the B-P/LM and Pasaran CD tests of independence is that residuals across
+entities are not correlated. B-P/LM and Pasaran CD (cross-sectional dependence) tests are used to test whether the residuals are correlated across entities. Cross-sectional dependence can lead to bias in tests results (also called contemporaneous correlation). 
+
+### Include all policy
+
+```{r}
+fe_mod_all_policy <- plm(all_policy, data=pdf, model='within', effects = 'twoways')
+summary(fe_mod_all_policy)
+plot_coeffs_S(fe_mod_all_policy)
+```
+
+```{r echo=FALSE}
+pbgtest(fe_mod_all_policy) # serial correlation present
+bptest(fe_mod_all_policy, data = pdf, studentize=F) # heteroskedasticity present
+coeftest(fe_mod_all_policy, vcovHC(fe_mod_all_policy, method='arellano'))
+```
+
+## Random Effect Model 
+
+```{r}
+re_mod_main_policy <- plm(main_policy, data = pdf, model = 'random')
+summary(re_mod_main_policy)
+plot_coeffs_S(re_mod_main_policy)
+```
+
+### Random Effect Model Diagnostics
+
+Should I go for fixed effect model vs random effect model? if p-value is small, then prefer random effect
+
+```{r}
+phtest(fe_mod_main_policy, re_mod_main_policy)
+```
+
+Should I go for random effect on all policy?
+
+```{r}
+re_mod_all_policy <- plm(all_policy, data = pdf, model = 'random')
+summary(re_mod_all_policy)
+plot_coeffs_S(re_mod_all_policy)
+```
+
+Fixed vs Random Effect
+
+```{r}
+phtest(fe_mod_all_policy, re_mod_all_policy)
+```
+
+Run a fixed effects model and save the estimates, then run a random model and save the
+estimates, then perform the test. If the p-value is significant (for example <0.05) then use fixed effects, if not use random effects.
+
+### Controlling for Heteroskedasticity: Random Effects
+
+Controlling for heteroskedasticity
+
+```{r}
+a <- coeftest(re_mod_main_policy1, vcovHC(re_mod_main_policy1, type='HC0'))
+attributes(a)
+class(a)
+a[,1]
+```
+
+Controlling for heteroskedasticity
+
+```{r}
+coeftest(re_mod_all_policy, vcovHC(re_mod_all_policy, type='HC0'))
+```
+
+### One Way Random Effect
+
+```{r}
+main_policy1 <- retail_and_recreation ~ STEMERG + CLSCHOOL + 
+    CLDAYCR + CLNURSHM + STAYHOME + CLBSNS + FM_ALL + 
+    FM_EMP + CLREST + CLGYM + 
+    CLMOVIE + PDSKLV	+ MEDEXP + POPDEN18 + RISKCOV + UIMAXEXT + date
+```
+
+```{r}
+pdf1 <- pdata.frame(mydata, index=c('state'))
+re_mod_main_policy1 <- plm(main_policy, data = pdf1, model = 'random')
+re_mod_main_policy1 <- plm(main_policy, data = pdf, index=c('state'), model = 'random')
+summary(re_mod_main_policy1)
+plot_coeffs_S(re_mod_main_policy)
+```
+
+```{r}
+plot_coeffs_S1(a)
+```
+
+## First Difference
+
+```{r}
+fd_mod_main_policy <- plm(main_policy, data=pdf, model = "fd")
+summary(fd_mod_all)
+plot_coeffs_S(fd_mod_main_policy)
+```
+
+```{r}
+fd_mod_all_policy <- plm(all_policy, data=pdf, model = "fd")
+summary(fd_mod_both)
+plot_coeffs_S(fd_mod_all_policy)
+```
+
+## Model Comparisons
+
+```{r}
+stargazer(pooled_mod_all, fd_mod_all, fe_mod_all, type='text', title='Comparison of Panel Data Models', style='aer', column.labels=c('Pooled OLS', 'First Difference', 'Fixed Effect'))
+```
+
+```{r}
+stargazer(pooled_mod_both, fd_mod_both, fe_mod_both, type='text', title='Comparison of Panel Data Models', style='aer')
+```
+
+```{r}
+stargazer(pooled_mod_policy, fd_mod_policy, fe_mod_policy, type='text', title='Comparison of Panel Data Models', style='aer')
+```
+
+```{r}
+stargazer(fe_mod_all, fe_mod_both, fe_mod_policy, type='text', title='Comparison of Panel Data Models', style='aer')
+```
